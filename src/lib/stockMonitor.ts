@@ -245,7 +245,7 @@ function isRestockChange(change: StockChange): change is Extract<StockChange, { 
 function formatPriceForTitle(p: PlanStockEntry): string {
 	if (!p.price || p.price === '—') return '—';
 	const cleaned = String(p.price).replace(/^\$/u, '').trim();
-	return `$${cleaned}/mo`;
+	return `$${cleaned}`;
 }
 
 function formatEmbedTitle(p: PlanStockEntry): string {

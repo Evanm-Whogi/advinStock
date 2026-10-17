@@ -1,6 +1,6 @@
 import { Events, Listener } from '@sapphire/framework';
 import type { Interaction } from 'discord.js';
-import { stickyStockManager } from '../lib/stickyStock';
+import { isStockNavigation, stickyStockManager } from '../lib/stickyStock';
 
 export class StockPaginationListener extends Listener<typeof Events.InteractionCreate> {
 	public constructor(context: Listener.LoaderContext, options: Listener.Options) {
@@ -9,7 +9,7 @@ export class StockPaginationListener extends Listener<typeof Events.InteractionC
 
 	public async run(interaction: Interaction) {
 		if (!interaction.isButton()) return;
-		if (!interaction.customId.startsWith('stock:category:') && !['stock:previous', 'stock:next'].includes(interaction.customId)) return;
+		if (!isStockNavigation(interaction.customId)) return;
 		try {
 			await stickyStockManager.handlePagination(interaction);
 		} catch (error) {

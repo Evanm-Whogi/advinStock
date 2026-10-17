@@ -8,7 +8,7 @@ import { buildOrderUrl } from './orderUrl';
 function formatPrice(p: PlanStockEntry): string {
 	if (!p.price || p.price === '—') return '—';
 	const cleaned = String(p.price).replace(/^\$/u, '').trim().slice(0, 32);
-	return `$${cleaned}/mo`;
+	return `$${cleaned}`;
 }
 
 export function formatStockRow(p: PlanStockEntry): string {
@@ -121,15 +121,95 @@ export function buildStockPageButtons(page: number, pages: StockSummaryPage[]): 
 	const previous = page > 0 && (categories.length > 20 || pages[page - 1].categoryId === pages[page].categoryId);
 	const next = page + 1 < pages.length && (categories.length > 20 || pages[page + 1].categoryId === pages[page].categoryId);
 	if (previous || next) rows.push(new ActionRowBuilder<ButtonBuilder>().addComponents(
-		new ButtonBuilder().setCustomId('stock:previous').setLabel('Previous').setStyle(ButtonStyle.Secondary).setDisabled(!previous),
-		new ButtonBuilder().setCustomId('stock:next').setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(!next)
+		new ButtonBuilder().setCustomId(stockPageId(Math.max(0, page - 1), pages)).setLabel('Previous').setStyle(ButtonStyle.Secondary).setDisabled(!previous),
+		new ButtonBuilder().setCustomId(stockPageId(Math.min(pages.length - 1, page + 1), pages)).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(!next)
 	));
 	return rows;
+}
+
+/** A complete, non-interactive channel summary, split only at Discord's message limits. */
+export function buildStockTrackerMessages(map: Map<string, PlanStockEntry>) {
+	const groups = new Map<number, { name: string; plans: PlanStockEntry[] }>();
+	let inStock = 0;
+	for (const plan of map.values()) {
+		if (plan.stock <= 0) continue;
+		if (!groups.has(plan.categoryId)) groups.set(plan.categoryId, { name: plan.categoryName, plans: [] });
+		groups.get(plan.categoryId)!.plans.push(plan);
+		inStock++;
+	}
+	const descriptions: string[] = [];
+	let description = '';
+	const addCategory = (text: string) => {
+		if (description && description.length + text.length + 2 > 4096) {
+			descriptions.push(description);
+			description = '';
+		}
+		description += (description ? '\n\n' : '') + text;
+	};
+	for (const group of [...groups.values()].sort((a, b) => compareCategories(a.name, b.name))) {
+		const name = escapeMarkdown(group.name.slice(0, 240)).replace(/[\r\n]+/gu, ' ') || 'Other products';
+		group.plans.sort((a, b) => a.locationName.localeCompare(b.locationName) || a.planName.localeCompare(b.planName, undefined, { numeric: true }));
+		let section = '';
+		let previousLocation: string | null = null;
+		for (const plan of group.plans) {
+			const location = escapeMarkdown(plan.locationName.slice(0, 120)).replace(/[\r\n]+/gu, ' ') || 'Unknown location';
+			const heading = `**${name} · ${location}**`;
+			if (previousLocation !== plan.locationName) {
+				if (section) addCategory(section);
+				section = heading;
+			}
+			const row = formatStockRow(plan);
+			if (section.length + row.length + 1 > 4096) {
+				addCategory(section);
+				section = `${heading} (continued)`;
+			}
+			section += `\n${row}`;
+			previousLocation = plan.locationName;
+		}
+		if (section) addCategory(section);
+	}
+	if (description) descriptions.push(description);
+	if (!descriptions.length) descriptions.push('No plans are currently in stock.');
+	return descriptions.map((text, index) => ({
+		content: '',
+		embeds: [new EmbedBuilder().setTitle(index ? 'Current Stock (continued)' : 'Current Stock')
+			.setDescription(text).setColor(inStock ? 0x57f287 : 0xed4245)
+			.setFooter({ text: `${inStock} of ${map.size} plans in stock` }).setTimestamp()],
+		components: []
+	}));
+}
+
+export function buildStockLauncher() {
+	return {
+		content: 'Browse current stock privately.',
+		embeds: [],
+		components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
+			new ButtonBuilder().setCustomId('stock:open').setLabel('View stock').setStyle(ButtonStyle.Primary)
+		)]
+	};
+}
+
+export function buildStockView(map: Map<string, PlanStockEntry>) {
+	const pages = buildStockSummaryPages(map);
+	const page = Math.max(0, pages.findIndex(candidate => candidate.categoryName === 'KVM Standard VPS'));
+	return { embeds: [pages[page].embed], components: buildStockPageButtons(page, pages) };
+}
+
+/** Encode the destination in the button so each private message carries its own state. */
+function stockPageId(page: number, pages: StockSummaryPage[]): string {
+	const categoryId = pages[page].categoryId;
+	const offset = pages.slice(0, page).filter(candidate => candidate.categoryId === categoryId).length;
+	return `stock:page:${categoryId}:${offset}`;
+}
+
+export function isStockNavigation(customId: string): boolean {
+	return /^stock:(?:open|category:\d+|page:\d+:\d+|previous|next)$/u.test(customId);
 }
 
 type StickyState = {
 	channelId: string;
 	messageId: string;
+	messageIds?: string[];
 };
 
 async function readState(path: string, logger: Client['logger']): Promise<StickyState | null> {
@@ -137,7 +217,11 @@ async function readState(path: string, logger: Client['logger']): Promise<Sticky
 		const raw = await readFile(path, 'utf8');
 		const parsed = JSON.parse(raw) as Partial<StickyState>;
 		if (parsed && typeof parsed.channelId === 'string' && typeof parsed.messageId === 'string') {
-			return { channelId: parsed.channelId, messageId: parsed.messageId };
+			return {
+				channelId: parsed.channelId, messageId: parsed.messageId,
+				messageIds: Array.isArray(parsed.messageIds) && parsed.messageIds.every(id => typeof id === 'string')
+					? parsed.messageIds : [parsed.messageId]
+			};
 		}
 		return null;
 	} catch (error) {
@@ -155,19 +239,15 @@ async function writeState(path: string, state: StickyState): Promise<void> {
 }
 
 /**
- * Manages a single "sticky" stock-summary embed that lives at the bottom of the
- * alert channel. It can be edited in place (to refresh counts) or re-posted
- * (deleted + re-sent) so it drops back to the bottom below newer messages.
+ * Keeps the full category summary below alerts. Tabbed tables are private replies.
  */
 export class StickyStockManager {
 	private channel: string | null = null;
 	private statePath = join(process.cwd(), 'data', 'sticky-stock.json');
-	private messageId: string | null = null;
+	private messageIds: string[] = [];
 	private latest: Map<string, PlanStockEntry> | null = null;
 	private hydrated = false;
 	private pages: StockSummaryPage[] | null = null;
-	private page = 0;
-	private selectedCategoryId: number | null = null;
 
 	private queue: Promise<void> = Promise.resolve();
 	private restickTimer: ReturnType<typeof setTimeout> | null = null;
@@ -179,9 +259,7 @@ export class StickyStockManager {
 	public configure(options: { channelId: string; statePath?: string }): void {
 		if (this.channel !== options.channelId || (options.statePath && options.statePath !== this.statePath)) {
 			this.hydrated = false;
-			this.messageId = null;
-			this.page = 0;
-			this.selectedCategoryId = null;
+			this.messageIds = [];
 		}
 		this.channel = options.channelId;
 		if (options.statePath) this.statePath = options.statePath;
@@ -213,7 +291,7 @@ export class StickyStockManager {
 		this.hydrated = true;
 		const state = await readState(this.statePath, client.logger);
 		if (state && state.channelId === this.channel) {
-			this.messageId = state.messageId;
+			this.messageIds = state.messageIds ?? [state.messageId];
 		}
 	}
 
@@ -247,66 +325,68 @@ export class StickyStockManager {
 				return;
 			}
 
-			const pages = this.getPages();
-			this.page = Math.min(this.page, pages.length - 1);
-			if (pages[this.page].categoryId !== this.selectedCategoryId) {
-				const selected = pages.findIndex(p => p.categoryId === this.selectedCategoryId);
-				const defaultPage = pages.findIndex(p => p.categoryName === 'KVM Standard VPS');
-				this.page = selected >= 0 ? selected : Math.max(0, defaultPage);
-			}
-			this.selectedCategoryId = pages[this.page].categoryId;
-			const payload = { embeds: [pages[this.page].embed], components: buildStockPageButtons(this.page, pages) };
+			const channelId = this.channel;
+			const persist = async () => {
+				await writeState(this.statePath, { channelId, messageId: this.messageIds[0] ?? '', messageIds: this.messageIds })
+					.catch(error => client.logger.warn('[sticky] Failed to persist sticky state', error));
+			};
+			const remove = async (id: string) => {
+				await channel.messages.delete(id).catch(error => { if (!isUnknownMessage(error)) throw error; });
+				this.messageIds = this.messageIds.filter(messageId => messageId !== id);
+				await persist();
+			};
+			if (restick) for (const id of [...this.messageIds]) await remove(id);
 
-			if (!restick && this.messageId) {
-				const existing = await channel.messages.fetch(this.messageId).catch(error => {
+			const payloads = buildStockTrackerMessages(this.latest);
+			for (const [index, payload] of payloads.entries()) {
+				const id = this.messageIds[index];
+				const existing = id ? await channel.messages.fetch(id).catch(error => {
 					if (!isUnknownMessage(error)) throw error;
 					return null;
-				});
-				if (existing) {
-					await existing.edit(payload);
-					return;
+				}) : null;
+				if (existing) await existing.edit(payload);
+				else {
+					const sent = await channel.send(payload);
+					this.messageIds[index] = sent.id;
+					await persist();
 				}
 			}
-
-			if (this.messageId) {
-				await channel.messages.delete(this.messageId).catch(error => {
-					if (!isUnknownMessage(error)) throw error;
-				});
-				this.messageId = null;
-			}
-
-			const sent = await channel.send(payload);
-			this.messageId = sent.id;
-			await writeState(this.statePath, { channelId: this.channel, messageId: sent.id }).catch((err) =>
-				client.logger.warn('[sticky] Failed to persist sticky state', err)
-			);
+			for (const id of this.messageIds.slice(payloads.length)) await remove(id);
 		});
 	}
 
-	/** Button handling stays available across restarts and sticky reposts. */
+	/** Public buttons open a private view; its buttons update only that private message. */
 	public async handlePagination(interaction: ButtonInteraction): Promise<void> {
-		if (!interaction.customId.startsWith('stock:category:') && !['stock:previous', 'stock:next'].includes(interaction.customId)) return;
-		if (interaction.channelId !== this.channel || interaction.message.id !== this.messageId || !this.latest) {
+		if (!isStockNavigation(interaction.customId)) return;
+		const privateView = interaction.message.flags.has(MessageFlags.Ephemeral);
+		const launcher = interaction.customId === 'stock:open';
+		if (!this.latest || (!privateView && !launcher &&
+			(interaction.channelId !== this.channel || !this.messageIds.includes(interaction.message.id)))) {
 			await interaction.reply({ content: 'This stock summary has moved. Use the latest summary in the channel.', flags: MessageFlags.Ephemeral });
 			return;
 		}
-		await interaction.deferUpdate();
-		await this.run(async () => {
-			if (!this.latest || interaction.message.id !== this.messageId) return;
-			const pages = this.getPages();
-			if (interaction.customId.startsWith('stock:category:')) {
-				const categoryId = Number(interaction.customId.slice('stock:category:'.length));
-				const selected = pages.findIndex(p => p.categoryId === categoryId);
-				if (selected < 0) return;
-				this.page = selected;
-			} else {
-				const target = this.page + (interaction.customId === 'stock:next' ? 1 : -1);
-				if (!pages[target]) return;
-				this.page = target;
-			}
-			this.selectedCategoryId = pages[this.page].categoryId;
-			await interaction.editReply({ embeds: [pages[this.page].embed], components: buildStockPageButtons(this.page, pages) });
-		});
+
+		if (privateView) await interaction.deferUpdate();
+		else await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+		const pages = this.getPages();
+		let page = Math.max(0, pages.findIndex(candidate => candidate.categoryName === 'KVM Standard VPS'));
+		const target = /^stock:(category|page):(\d+)(?::(\d+))?$/u.exec(interaction.customId);
+		if (target) {
+			const categoryId = Number(target[2]);
+			const offset = Number(target[3] ?? 0);
+			const categoryPages = pages.map((candidate, index) => ({ candidate, index }))
+				.filter(({ candidate }) => candidate.categoryId === categoryId);
+			if (categoryPages.length) page = categoryPages[Math.min(offset, categoryPages.length - 1)].index;
+		} else if (!launcher) {
+			// Older shared messages may still have relative previous/next buttons until refreshed.
+			const source = interaction.message.embeds[0];
+			const categoryPage = pages.findIndex(candidate => candidate.embed.data.title === source?.title);
+			const offset = Number(/ · Page (\d+) of /u.exec(source?.footer?.text ?? '')?.[1] ?? 1) - 1;
+			const current = categoryPage < 0 ? page : categoryPage + offset;
+			page = Math.max(0, Math.min(pages.length - 1, current + (interaction.customId === 'stock:next' ? 1 : -1)));
+		}
+		await interaction.editReply({ embeds: [pages[page].embed], components: buildStockPageButtons(page, pages) });
 	}
 
 	/** Debounced re-post to the bottom, used when other messages arrive. */
