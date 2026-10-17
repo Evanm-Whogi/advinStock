@@ -1,12 +1,8 @@
 import { Command } from '@sapphire/framework';
-import type { ChatInputCommandInteraction, Message } from 'discord.js';
-import { EmbedBuilder } from 'discord.js';
-import { readFile } from 'node:fs/promises';
+import { EmbedBuilder, MessageFlags, type ChatInputCommandInteraction, type Message } from 'discord.js';
 import { join } from 'node:path';
-import type { PlanStockEntry } from '../lib/stockMonitor';
-import { buildStockSummaryPages, stockEmbedTextLength } from '../lib/stickyStock';
-
-type Plan = PlanStockEntry;
+import { readSnapshotFromDisk, type PlanStockEntry } from '../lib/stockMonitor';
+import { buildStockSummaryPages, stockEmbedTextLength, stickyStockManager } from '../lib/stickyStock';
 
 export class StockCommand extends Command {
 	public constructor(context: Command.LoaderContext, options: Command.Options) {
@@ -18,16 +14,11 @@ export class StockCommand extends Command {
 		});
 	}
 
-	private async loadStockData(): Promise<Plan[]> {
-		try {
-			const dataPath = process.env.STOCK_SNAPSHOT_PATH || join(process.cwd(), 'data', 'stock-snapshot.json');
-			const fileContent = await readFile(dataPath, 'utf-8');
-			const data = JSON.parse(fileContent);
-			return Array.isArray(data.plans) ? data.plans : [];
-		} catch (error) {
-			console.error('Error loading stock data:', error);
-			return [];
-		}
+	private async loadStockData(): Promise<Map<string, PlanStockEntry> | null> {
+		const latest = stickyStockManager.getLatest();
+		if (latest) return latest;
+		const path = process.env.STOCK_SNAPSHOT_PATH || join(process.cwd(), 'data', 'stock-snapshot.json');
+		return readSnapshotFromDisk(path, this.container.logger);
 	}
 
 	public override registerApplicationCommands(registry: Command.Registry) {
@@ -37,16 +28,17 @@ export class StockCommand extends Command {
 	}
 
 	private async sendStock(messageLike: Message | ChatInputCommandInteraction) {
+		const interaction = 'deferReply' in messageLike ? messageLike : null;
+		if (interaction) await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 		const plans = await this.loadStockData();
-		const inStockPlans = plans.filter((plan) => plan.stock > 0);
-
-		if (inStockPlans.length === 0) {
-			const payload = { content: 'No items currently in stock.', ephemeral: true };
-			await messageLike.reply(payload);
+		if (!plans || ![...plans.values()].some(plan => plan.stock > 0)) {
+			const payload = { content: plans ? 'No items currently in stock.' : 'Stock data is temporarily unavailable. Please try again shortly.' };
+			if (interaction) await interaction.editReply(payload);
+			else await messageLike.reply(payload);
 			return;
 		}
 
-		const embeds = buildStockSummaryPages(new Map(plans.map(plan => [plan.key, plan])))
+		const embeds = buildStockSummaryPages(plans)
 			.filter(page => (page.embed.data.fields?.length ?? 0) > 0)
 			.map(page => page.embed);
 
@@ -65,10 +57,11 @@ export class StockCommand extends Command {
 		}
 		if (batch.length > 0) batches.push(batch);
 
-		await messageLike.reply({ embeds: batches[0], ephemeral: true });
+		if (interaction) await interaction.editReply({ embeds: batches[0] });
+		else await messageLike.reply({ embeds: batches[0] });
 		for (const remaining of batches.slice(1)) {
 			if ('followUp' in messageLike) {
-				await messageLike.followUp({ embeds: remaining, ephemeral: true });
+				await messageLike.followUp({ embeds: remaining, flags: MessageFlags.Ephemeral });
 			} else {
 				await messageLike.reply({ embeds: remaining });
 			}

@@ -1,8 +1,10 @@
 import axios from 'axios';
 import { EmbedBuilder, type Client } from 'discord.js';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { stickyStockManager } from './stickyStock';
+import { buildOrderUrl } from './orderUrl';
+import { writeJsonAtomic } from './persistence';
 
 export type PlanStockEntry = {
 	key: string;
@@ -78,7 +80,7 @@ export function extractPlanStockMap(data: unknown): Map<string, PlanStockEntry> 
 		const categoryId = Number(cat.id);
 		const categoryName = String(cat.name ?? 'Unknown category');
 		const locations = cat.locations;
-		if (!Number.isFinite(categoryId) || !Array.isArray(locations)) throw new Error('[stock] Invalid group ID or locations in API response.');
+		if (cat.id == null || !Number.isSafeInteger(categoryId) || categoryId <= 0 || !Array.isArray(locations)) throw new Error('[stock] Invalid group ID or locations in API response.');
 
 		for (const rawLoc of locations) {
 			if (!rawLoc || typeof rawLoc !== 'object') throw new Error('[stock] Invalid location in API response.');
@@ -86,7 +88,7 @@ export function extractPlanStockMap(data: unknown): Map<string, PlanStockEntry> 
 			const locationId = Number(loc.id);
 			const locationName = String(loc.display_name ?? loc.name ?? 'Unknown location');
 			const plans = loc.plans;
-			if (!Number.isFinite(locationId) || !Array.isArray(plans)) throw new Error('[stock] Invalid location ID or plans in API response.');
+			if (loc.id == null || !Number.isSafeInteger(locationId) || locationId <= 0 || !Array.isArray(plans)) throw new Error('[stock] Invalid location ID or plans in API response.');
 
 			for (const rawPlan of plans) {
 				if (!rawPlan || typeof rawPlan !== 'object') throw new Error('[stock] Invalid plan in API response.');
@@ -94,10 +96,13 @@ export function extractPlanStockMap(data: unknown): Map<string, PlanStockEntry> 
 				const planId = Number(plan.id);
 				const stockRaw = plan.stock;
 				const stock = typeof stockRaw === 'number' ? stockRaw : Number(stockRaw);
-				if (!Number.isFinite(planId) || stockRaw == null || !Number.isFinite(stock) || stock < 0) {
+				if (plan.id == null || !Number.isSafeInteger(planId) || planId <= 0 ||
+					!['number', 'string'].includes(typeof stockRaw) || String(stockRaw).trim() === '' ||
+					!Number.isSafeInteger(stock) || stock < 0) {
 					throw new Error('[stock] Invalid plan ID or stock quantity in API response.');
 				}
 				const key = PLAN_KEY(categoryId, locationId, planId);
+				if (map.has(key)) throw new Error(`[stock] Duplicate plan key: ${key}`);
 				const specs = readSpecsFromPlanJson(plan);
 				map.set(key, {
 					key,
@@ -109,7 +114,7 @@ export function extractPlanStockMap(data: unknown): Map<string, PlanStockEntry> 
 					locationName,
 					planId,
 					planName: String(plan.name ?? 'Unknown plan'),
-					stock: Number.isFinite(stock) ? stock : 0,
+					stock,
 					...specs
 				});
 			}
@@ -123,13 +128,14 @@ function isPlanStockEntry(x: unknown): x is PlanStockEntry {
 	const o = x as Record<string, unknown>;
 	return (
 		typeof o.key === 'string' &&
-		Number.isFinite(Number(o.categoryId)) &&
+		typeof o.categoryId === 'number' && Number.isSafeInteger(o.categoryId) && o.categoryId > 0 &&
 		typeof o.categoryName === 'string' &&
-		Number.isFinite(Number(o.locationId)) &&
+		typeof o.locationId === 'number' && Number.isSafeInteger(o.locationId) && o.locationId > 0 &&
 		typeof o.locationName === 'string' &&
-		Number.isFinite(Number(o.planId)) &&
+		typeof o.planId === 'number' && Number.isSafeInteger(o.planId) && o.planId > 0 &&
 		typeof o.planName === 'string' &&
-		Number.isFinite(Number(o.stock))
+		typeof o.stock === 'number' && Number.isSafeInteger(o.stock) && o.stock >= 0 &&
+		o.key === PLAN_KEY(o.categoryId, o.locationId, o.planId)
 	);
 }
 
@@ -163,20 +169,20 @@ function planEntryFromRecord(o: Record<string, unknown>): PlanStockEntry {
 	};
 }
 
-function parseSnapshotPayload(data: unknown): Map<string, PlanStockEntry> | null {
+export function parseSnapshotPayload(data: unknown): Map<string, PlanStockEntry> | null {
 	if (!data || typeof data !== 'object') return null;
 	const plans = (data as { plans?: unknown }).plans;
 	if (!Array.isArray(plans)) return null;
 	const map = new Map<string, PlanStockEntry>();
 	for (const item of plans) {
-		if (!isPlanStockEntry(item)) continue;
+		if (!isPlanStockEntry(item) || map.has(item.key)) return null;
 		const entry = planEntryFromRecord(item as Record<string, unknown>);
 		map.set(entry.key, entry);
 	}
 	return map;
 }
 
-async function readSnapshotFromDisk(filePath: string, logger: Client['logger']): Promise<Map<string, PlanStockEntry> | null> {
+export async function readSnapshotFromDisk(filePath: string, logger: Client['logger']): Promise<Map<string, PlanStockEntry> | null> {
 	try {
 		const raw = await readFile(filePath, 'utf8');
 		let parsed: unknown;
@@ -206,8 +212,7 @@ async function writeSnapshotToDisk(filePath: string, map: Map<string, PlanStockE
 		savedAt: new Date().toISOString(),
 		plans
 	};
-	await mkdir(dirname(filePath), { recursive: true });
-	await writeFile(filePath, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+	await writeJsonAtomic(filePath, payload);
 }
 
 export function diffPlanStockMaps(previous: Map<string, PlanStockEntry>, next: Map<string, PlanStockEntry>): StockChange[] {
@@ -300,44 +305,17 @@ function embedColorForChanges(changes: StockChange[]): number {
 	return 0x5865f2;
 }
 
-const DESC_LIMIT = 3900;
-
-function chunkDescriptions(lines: string[]): string[] {
-	const chunks: string[] = [];
-	let current = '';
-	for (const line of lines) {
-		const addition = (current ? '\n\n' : '') + line;
-		if (current.length + addition.length > DESC_LIMIT) {
-			if (current) chunks.push(current);
-			current = line.length > DESC_LIMIT ? line.slice(0, DESC_LIMIT) : line;
-			continue;
-		}
-		current += addition;
-	}
-	if (current) chunks.push(current);
-	return chunks;
-}
-
 export function buildStockChangeEmbeds(changes: StockChange[]): EmbedBuilder[] {
-	if (changes.length === 0) return [];
 	const color = embedColorForChanges(changes);
-	const embeds: EmbedBuilder[] = [];
-	for (const c of changes) {
-		const plan = planForChange(c);
-		const title = formatEmbedTitle(plan);
-		const descChunks = chunkDescriptions([changeToEmbedDescription(c)]);
-		for (let i = 0; i < descChunks.length; i++) {
-			const productUrl = 'https://console.advinservers.com/order';
-			const embed = new EmbedBuilder()
-				.setColor(color)
-				.setTitle(i === 0 ? title : `${title} (continued)`)
-				.setDescription(descChunks[i])
-				.setTimestamp();
-			if (productUrl) embed.setURL(productUrl);
-			embeds.push(embed);
-		}
-	}
-	return embeds;
+	return changes.map(change => {
+		const plan = planForChange(change);
+		return new EmbedBuilder()
+			.setColor(color)
+			.setTitle(formatEmbedTitle(plan).slice(0, 256))
+			.setDescription(changeToEmbedDescription(change).slice(0, 4096))
+			.setURL(buildOrderUrl(plan.whmcsId))
+			.setTimestamp();
+	});
 }
 
 export type StockMonitorOptions = {
@@ -351,14 +329,17 @@ export type StockMonitorOptions = {
 /**
  * Polls a JSON URL on an interval, persists the last snapshot to disk, and posts embeds when stock (or plan set) changes.
  */
-export function startStockMonitor(client: Client, options: StockMonitorOptions): () => void {
+export function startStockMonitor(client: Client, options: StockMonitorOptions): () => Promise<void> {
 	const { url, channelId, intervalMs = 5 * 60 * 1000, snapshotPath = join(process.cwd(), 'data', 'stock-snapshot.json') } =
 		options;
 	let previous: Map<string, PlanStockEntry> | null = null;
 	let hydratedFromDisk = false;
-	let timer: ReturnType<typeof setInterval> | null = null;
+	let timer: ReturnType<typeof setTimeout> | null = null;
+	let stopped = false;
+	let activeTick: Promise<void>;
+	const controller = new AbortController();
 
-	stickyStockManager.configure({ channelId });
+	stickyStockManager.configure({ channelId, statePath: join(dirname(snapshotPath), 'sticky-stock.json') });
 
 	const tick = async () => {
 		try {
@@ -373,15 +354,18 @@ export function startStockMonitor(client: Client, options: StockMonitorOptions):
 
 			const { data } = await axios.get<unknown>(url, {
 				timeout: 45_000,
+				signal: controller.signal,
+				maxContentLength: 5 * 1024 * 1024,
 				headers: { Accept: 'application/json' },
 				validateStatus: (s) => s === 200
 			});
+			if (stopped) return;
 			const next = extractPlanStockMap(data);
 			stickyStockManager.setLatest(next);
 
 			if (previous === null) {
-				previous = next;
 				await writeSnapshotToDisk(snapshotPath, next);
+				previous = next;
 				client.logger.info(
 					`[stock] Baseline saved (${next.size} plans) → ${snapshotPath}`
 				);
@@ -391,17 +375,18 @@ export function startStockMonitor(client: Client, options: StockMonitorOptions):
 			}
 
 			const changes = diffPlanStockMaps(previous, next);
-			previous = next;
-			await writeSnapshotToDisk(snapshotPath, next);
+			const changed = JSON.stringify([...previous.values()]) !== JSON.stringify([...next.values()]);
 			const restockChanges = changes.filter(isRestockChange);
 
 			if (restockChanges.length === 0) {
+				if (changed) await writeSnapshotToDisk(snapshotPath, next);
+				previous = next;
 				// No restock alerts to post, just keep the sticky counts current.
 				await stickyStockManager.refresh(client);
 				return;
 			}
 
-			const channel = await client.channels.fetch(channelId).catch(() => null);
+			const channel = await client.channels.fetch(channelId);
 			if (!channel?.isSendable()) {
 				client.logger.warn(`[stock] Alert channel not found or not sendable: ${channelId}`);
 				return;
@@ -409,23 +394,31 @@ export function startStockMonitor(client: Client, options: StockMonitorOptions):
 
 			const embeds = buildStockChangeEmbeds(restockChanges);
 			for (const embed of embeds) {
-				await channel.send({ embeds: [embed] });
+				if (stopped) return;
+				await channel.send({ embeds: [embed], allowedMentions: { parse: [] } });
 			}
+			// Commit only after delivery so failed alerts are retried on the next poll.
+			await writeSnapshotToDisk(snapshotPath, next);
+			previous = next;
 
 			// Re-post the sticky summary so it sits at the bottom, below the alerts.
 			await stickyStockManager.refresh(client, true);
 		} catch (err) {
-			client.logger.error('[stock] Poll failed', err);
+			if (!stopped) client.logger.error('[stock] Poll failed', err);
 		}
 	};
 
-	void tick();
-	timer = setInterval(() => void tick(), intervalMs);
+	const poll = async () => {
+		await tick();
+		if (!stopped) timer = setTimeout(() => { activeTick = poll(); }, intervalMs);
+	};
+	activeTick = poll();
 
-	return () => {
-		if (timer) clearInterval(timer);
-		timer = null;
-		previous = null;
-		hydratedFromDisk = false;
+	return async () => {
+		stopped = true;
+		controller.abort();
+		if (timer) clearTimeout(timer);
+		await activeTick;
+		await stickyStockManager.stop();
 	};
 }

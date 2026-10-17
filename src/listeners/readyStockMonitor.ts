@@ -1,5 +1,6 @@
 import { Events, Listener } from '@sapphire/framework';
 import { startStockMonitor } from '../lib/stockMonitor';
+import { onShutdown } from '../lib/lifecycle';
 
 export class ReadyStockMonitorListener extends Listener<typeof Events.ClientReady> {
 	public constructor(context: Listener.LoaderContext, options: Listener.Options) {
@@ -29,23 +30,24 @@ export class ReadyStockMonitorListener extends Listener<typeof Events.ClientRead
 		let intervalMs = 5 * 60 * 1000; // Default to 5 minutes
 		if (intervalRaw) {
 			const parsed = Number(intervalRaw);
-			if (Number.isFinite(parsed) && parsed >= 10_000) {
+			if (Number.isSafeInteger(parsed) && parsed >= 10_000 && parsed <= 2_147_483_647) {
 				intervalMs = parsed;
 			} else {
 				this.container.logger.warn(
-					'[stock] STOCK_POLL_INTERVAL_MS invalid or < 10000; using default 5 minutes.'
+					'[stock] STOCK_POLL_INTERVAL_MS must be an integer from 10000 to 2147483647; using default 5 minutes.'
 				);
 			}
 		}
 
 		const snapshotPath = process.env.STOCK_SNAPSHOT_PATH;
 
-		startStockMonitor(this.container.client, {
+		const stop = startStockMonitor(this.container.client, {
 			url,
 			channelId,
 			intervalMs,
 			...(snapshotPath ? { snapshotPath } : {})
 		});
-		this.container.logger.info('[stock] Polling started.');
+		onShutdown(stop);
+		this.container.logger.info(`[stock] Polling started; interval ${intervalMs}ms.`);
 	}
 }
