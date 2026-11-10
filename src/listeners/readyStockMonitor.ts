@@ -1,5 +1,6 @@
 import { Events, Listener } from '@sapphire/framework';
 import { startStockMonitor } from '../lib/stockMonitor';
+import { getConfig } from '../lib/config';
 import { onShutdown } from '../lib/lifecycle';
 
 export class ReadyStockMonitorListener extends Listener<typeof Events.ClientReady> {
@@ -17,35 +18,17 @@ export class ReadyStockMonitorListener extends Listener<typeof Events.ClientRead
 			status: 'online'
 		});
 
-		const url = process.env.STOCK_JSON_URL || 'https://console.advinservers.com/api/v1/public/stock';
-		const channelId = process.env.STOCK_ALERT_CHANNEL_ID;
+		const { url, channelId, intervalMs, snapshotPath } = getConfig();
 		if (!channelId) {
-			this.container.logger.warn(
-				'[stock] Set STOCK_ALERT_CHANNEL_ID in .env to enable stock polling.'
-			);
+			this.container.logger.warn('[stock] Set STOCK_ALERT_CHANNEL_ID in .env to enable stock polling.');
 			return;
 		}
-
-		const intervalRaw = process.env.STOCK_POLL_INTERVAL_MS;
-		let intervalMs = 5 * 60 * 1000; // Default to 5 minutes
-		if (intervalRaw) {
-			const parsed = Number(intervalRaw);
-			if (Number.isSafeInteger(parsed) && parsed >= 10_000 && parsed <= 2_147_483_647) {
-				intervalMs = parsed;
-			} else {
-				this.container.logger.warn(
-					'[stock] STOCK_POLL_INTERVAL_MS must be an integer from 10000 to 2147483647; using default 5 minutes.'
-				);
-			}
-		}
-
-		const snapshotPath = process.env.STOCK_SNAPSHOT_PATH;
 
 		const stop = startStockMonitor(this.container.client, {
 			url,
 			channelId,
 			intervalMs,
-			...(snapshotPath ? { snapshotPath } : {})
+			snapshotPath
 		});
 		onShutdown(stop);
 		this.container.logger.info(`[stock] Polling started; interval ${intervalMs}ms.`);

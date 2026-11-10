@@ -1,19 +1,20 @@
 import { Command } from '@sapphire/framework';
-import type { Message, TextChannel } from 'discord.js';
+import type { Message } from 'discord.js';
 
 export class PingCommand extends Command {
-    public constructor(context: Command.LoaderContext, options: Command.Options) {
-      super(context, {
-        ...options,
-        name: 'ping',
-        aliases: ['pong'],
-        description: 'ping pong'
-      });
-    }
-    public async messageRun(message: Message) {
-      const msg = await (message.channel as TextChannel).send('Ping?');
-      const content = `Pong\n Bot Latency ${Math.round(this.container.client.ws.ping)}ms\n API Latency ${msg.createdTimestamp - message.createdTimestamp}ms.`;
+	public constructor(context: Command.LoaderContext, options: Command.Options) {
+		super(context, {
+			...options,
+			name: 'ping',
+			aliases: ['pong'],
+			description: 'ping pong'
+		});
+	}
+	public async messageRun(message: Message) {
+		if (!message.channel.isSendable()) return;
+		const msg = await message.channel.send('Ping?');
+		const content = `Pong\n Bot Latency ${Math.round(this.container.client.ws.ping)}ms\n API Latency ${msg.createdTimestamp - message.createdTimestamp}ms.`;
 
-      return msg.edit(content);
-    }
+		return msg.edit(content);
+	}
 }

@@ -1,10 +1,11 @@
 import { Command } from '@sapphire/framework';
 import { MessageFlags, type ChatInputCommandInteraction, type Message } from 'discord.js';
-import { join } from 'node:path';
-import { readSnapshotFromDisk, type PlanStockEntry } from '../lib/stockMonitor';
-import { buildStockLauncher, buildStockView, stickyStockManager } from '../lib/stickyStock';
+import { getConfig } from '../lib/config';
+import { readSnapshotFromDisk, type StockMap } from '../lib/stockData';
+import { buildStockLauncher, stickyStockManager } from '../lib/stickyStock';
 
 export class StockCommand extends Command {
+	private readonly manager = stickyStockManager;
 	public constructor(context: Command.LoaderContext, options: Command.Options) {
 		super(context, {
 			...options,
@@ -14,12 +15,12 @@ export class StockCommand extends Command {
 		});
 	}
 
-	private async loadStockData(): Promise<Map<string, PlanStockEntry> | null> {
-		const latest = stickyStockManager.getLatest();
+	private async loadStockData(): Promise<StockMap | null> {
+		const latest = this.manager.getLatest();
 		if (latest) return latest;
-		const path = process.env.STOCK_SNAPSHOT_PATH || join(process.cwd(), 'data', 'stock-snapshot.json');
+		const path = getConfig().snapshotPath;
 		const plans = await readSnapshotFromDisk(path, this.container.logger);
-		if (plans) stickyStockManager.setLatest(plans);
+		if (plans) this.manager.setLatest(plans);
 		return plans;
 	}
 
@@ -31,16 +32,16 @@ export class StockCommand extends Command {
 
 	public async messageRun(message: Message) {
 		const plans = await this.loadStockData();
-		await message.reply(plans ? buildStockLauncher() : {
-			content: 'Stock data is temporarily unavailable. Please try again shortly.'
-		});
+		await message.reply(
+			plans ? buildStockLauncher() : {content: 'Stock data is temporarily unavailable. Please try again shortly.'}
+		);
 	}
 
 	public async chatInputRun(interaction: ChatInputCommandInteraction) {
 		await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 		const plans = await this.loadStockData();
-		await interaction.editReply(plans ? buildStockView(plans) : {
-			content: 'Stock data is temporarily unavailable. Please try again shortly.'
-		});
+		await interaction.editReply(
+			plans ? this.manager.buildView() : { content: 'Stock data is temporarily unavailable. Please try again shortly.'}
+		);
 	}
 }

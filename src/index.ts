@@ -2,10 +2,11 @@ import { SapphireClient } from '@sapphire/framework';
 import { GatewayIntentBits } from 'discord.js';
 import { join } from 'node:path';
 import 'dotenv/config';
-import { shutdown } from './lib/lifecycle';
+import { shutdownAndDestroy } from './lib/lifecycle';
+import { getConfig } from './lib/config';
 
 async function main(): Promise<void> {
-	const token = process.env.DISCORD_TOKEN?.trim();
+	const { token } = getConfig();
 	if (!token) throw new Error('DISCORD_TOKEN is required.');
 
 	const client = new SapphireClient({
@@ -20,12 +21,13 @@ async function main(): Promise<void> {
 	const stop = async (signal: string) => {
 		if (stopping) return;
 		stopping = true;
+
 		client.logger.info(`[bot] Received ${signal}; shutting down.`);
 		const timeout = setTimeout(() => process.exit(1), 15_000);
 		timeout.unref();
+
 		try {
-			await shutdown();
-			await client.destroy();
+			await shutdownAndDestroy(() => client.destroy());
 		} catch (error) {
 			client.logger.error('[bot] Shutdown failed', error);
 			process.exitCode = 1;
@@ -33,9 +35,10 @@ async function main(): Promise<void> {
 			clearTimeout(timeout);
 		}
 	};
-	process.once('SIGINT', () => { void stop('SIGINT'); });
-	process.once('SIGTERM', () => { void stop('SIGTERM'); });
-	client.on('error', error => client.logger.error('[bot] Discord client error', error));
+
+	process.once('SIGINT', () => { void stop('SIGINT') });
+	process.once('SIGTERM', () => { void stop('SIGTERM') });
+	client.on('error', (error) => client.logger.error('[bot] Discord client error', error));
 
 	try {
 		await client.login(token);
@@ -45,7 +48,7 @@ async function main(): Promise<void> {
 	}
 }
 
-void main().catch(error => {
+void main().catch((error) => {
 	console.error('[bot] Startup failed:', error instanceof Error ? error.message : error);
 	process.exitCode = 1;
 });

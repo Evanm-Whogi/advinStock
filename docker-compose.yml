@@ -1,9 +1,9 @@
 services:
   stock-data-init:
     image: node:24.22.1-bookworm-slim
-    user: "0:0"
+    user: '0:0'
     network_mode: none
-    command: ["chown", "-R", "1000:1000", "/app/data"]
+    command: ['chown', '-R', '1000:1000', '/app/data']
     volumes:
       - stock-data:/app/data
 
